@@ -1,0 +1,8 @@
+# Binaries
+bin/
+*.exe
+*.test
+/engine
+
+# Local session storage
+.go_llm_engine/
