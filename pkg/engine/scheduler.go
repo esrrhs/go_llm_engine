@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/esrrhs/go_llm_engine/pkg/models"
@@ -27,7 +28,6 @@ func (s *Scheduler) ValidateDependencies() error {
 	s.tree.mu.RLock()
 	defer s.tree.mu.RUnlock()
 
-	// Check if all referenced dependencies exist
 	for _, node := range s.tree.Nodes {
 		for _, depID := range node.Contract.Dependencies {
 			if _, exists := s.tree.Nodes[depID]; !exists {
@@ -36,13 +36,15 @@ func (s *Scheduler) ValidateDependencies() error {
 		}
 	}
 
-	// Cycle detection using DFS
-	visited := make(map[string]int) // 0: unvisited, 1: visiting (in stack), 2: visited
+	visited := make(map[string]int) // 0: unvisited, 1: visiting, 2: visited
 
 	var dfs func(id string) error
 	dfs = func(id string) error {
 		visited[id] = 1
 		node := s.tree.Nodes[id]
+		if node == nil {
+			return fmt.Errorf("missing node %s during cycle detection", id)
+		}
 		for _, depID := range node.Contract.Dependencies {
 			if visited[depID] == 1 {
 				return fmt.Errorf("circular dependency detected involving %s and %s", id, depID)
@@ -70,8 +72,17 @@ func (s *Scheduler) ValidateDependencies() error {
 
 // AreDependenciesSatisfied checks if all dependencies of the node are in COMPLETED state.
 func (s *Scheduler) AreDependenciesSatisfied(node *models.TaskNode) bool {
+	if node == nil {
+		return false
+	}
+	s.tree.mu.RLock()
+	defer s.tree.mu.RUnlock()
+	return s.areDependenciesSatisfiedLocked(node)
+}
+
+func (s *Scheduler) areDependenciesSatisfiedLocked(node *models.TaskNode) bool {
 	for _, depID := range node.Contract.Dependencies {
-		depNode, exists := s.tree.GetNode(depID)
+		depNode, exists := s.tree.Nodes[depID]
 		if !exists || depNode.State != models.TaskStateCompleted {
 			return false
 		}
@@ -80,22 +91,31 @@ func (s *Scheduler) AreDependenciesSatisfied(node *models.TaskNode) bool {
 }
 
 // GetNextDecomposableNode finds a pending compound node ready to be broken down.
+// The returned node is a clone and is safe to read without holding the tree lock.
 func (s *Scheduler) GetNextDecomposableNode() *models.TaskNode {
 	s.tree.mu.RLock()
 	defer s.tree.mu.RUnlock()
 
+	var best *models.TaskNode
 	for _, node := range s.tree.Nodes {
-		if node.Type == models.NodeTypeCompound && node.State == models.TaskStatePending {
-			// Check if it already has children generated
-			if len(node.ChildrenIDs) == 0 && s.AreDependenciesSatisfied(node) {
-				return node
-			}
+		if node.Type != models.NodeTypeCompound || node.State != models.TaskStatePending {
+			continue
+		}
+		if len(node.ChildrenIDs) != 0 {
+			continue
+		}
+		if !s.areDependenciesSatisfiedLocked(node) {
+			continue
+		}
+		if best == nil || node.Depth < best.Depth || (node.Depth == best.Depth && node.ID < best.ID) {
+			best = node
 		}
 	}
-	return nil
+	return best.Clone()
 }
 
-// GetReadyLeafNodes returns all pending leaf nodes whose dependencies are satisfied.
+// GetReadyLeafNodes returns pending leaf nodes whose dependencies are satisfied.
+// Nodes are clones, ordered by depth then ID for stable scheduling.
 func (s *Scheduler) GetReadyLeafNodes() []*models.TaskNode {
 	s.tree.mu.RLock()
 	defer s.tree.mu.RUnlock()
@@ -103,15 +123,21 @@ func (s *Scheduler) GetReadyLeafNodes() []*models.TaskNode {
 	ready := make([]*models.TaskNode, 0)
 	for _, node := range s.tree.Nodes {
 		if node.Type == models.NodeTypeLeaf && node.State == models.TaskStatePending {
-			if s.AreDependenciesSatisfied(node) {
-				ready = append(ready, node)
+			if s.areDependenciesSatisfiedLocked(node) {
+				ready = append(ready, node.Clone())
 			}
 		}
 	}
+	sort.Slice(ready, func(i, j int) bool {
+		if ready[i].Depth != ready[j].Depth {
+			return ready[i].Depth < ready[j].Depth
+		}
+		return ready[i].ID < ready[j].ID
+	})
 	return ready
 }
 
-// UpdateNodeState updates the state of a node and automatically triggers parent state evaluation.
+// UpdateNodeState updates the state of a node and bubbles completion/failure to ancestors.
 func (s *Scheduler) UpdateNodeState(nodeID string, newState models.TaskState, errorMsg string) error {
 	s.tree.mu.Lock()
 	node, exists := s.tree.Nodes[nodeID]
@@ -123,61 +149,72 @@ func (s *Scheduler) UpdateNodeState(nodeID string, newState models.TaskState, er
 	node.State = newState
 	node.ErrorMsg = errorMsg
 	node.UpdatedAt = time.Now()
+	parentID := node.ParentID
 	s.tree.mu.Unlock()
 
-	// Bubble up completion or failure check to parent
-	if node.ParentID != "" {
-		s.checkAndUpdateParent(node.ParentID)
+	if parentID != "" {
+		s.checkAndUpdateParent(parentID)
 	}
 	return nil
 }
 
-// checkAndUpdateParent checks if all children of parent are completed, and if so marks parent completed.
+// RefreshAncestors re-evaluates parent state after a node type/state change that
+// did not go through UpdateNodeState (for example converting a failed leaf into a compound).
+func (s *Scheduler) RefreshAncestors(nodeID string) {
+	s.tree.mu.RLock()
+	node, exists := s.tree.Nodes[nodeID]
+	var parentID string
+	if exists {
+		parentID = node.ParentID
+	}
+	s.tree.mu.RUnlock()
+	if parentID != "" {
+		s.checkAndUpdateParent(parentID)
+	}
+}
+
+// checkAndUpdateParent walks ancestors synchronously and updates their aggregate state.
 func (s *Scheduler) checkAndUpdateParent(parentID string) {
-	s.tree.mu.Lock()
-	defer s.tree.mu.Unlock()
-
-	parent, exists := s.tree.Nodes[parentID]
-	if !exists || parent.Type != models.NodeTypeCompound {
-		return
-	}
-
-	if len(parent.ChildrenIDs) == 0 {
-		return
-	}
-
-	allCompleted := true
-	hasFailed := false
-
-	for _, cid := range parent.ChildrenIDs {
-		child, exists := s.tree.Nodes[cid]
-		if !exists {
-			continue
+	for parentID != "" {
+		s.tree.mu.Lock()
+		parent, exists := s.tree.Nodes[parentID]
+		if !exists || parent.Type != models.NodeTypeCompound || len(parent.ChildrenIDs) == 0 {
+			s.tree.mu.Unlock()
+			return
 		}
-		if child.State == models.TaskStateFailed {
-			hasFailed = true
-		}
-		if child.State != models.TaskStateCompleted {
-			allCompleted = false
-		}
-	}
 
-	if allCompleted {
-		parent.State = models.TaskStateCompleted
-		parent.UpdatedAt = time.Now()
-	} else if hasFailed {
-		// If any child failed permanently, parent reflects failure
-		parent.State = models.TaskStateFailed
-		parent.UpdatedAt = time.Now()
-	} else {
-		// If at least one child is running or decomposing, parent is running
-		parent.State = models.TaskStateRunning
-		parent.UpdatedAt = time.Now()
-	}
+		allSuccess := true
+		hasFailed := false
+		hasActive := false
 
-	// Recursively bubble up to grandparent if needed
-	if parent.ParentID != "" {
-		go s.checkAndUpdateParent(parent.ParentID)
+		for _, cid := range parent.ChildrenIDs {
+			child, ok := s.tree.Nodes[cid]
+			if !ok {
+				continue
+			}
+			switch child.State {
+			case models.TaskStateCompleted, models.TaskStateSkipped:
+			case models.TaskStateFailed:
+				hasFailed = true
+				allSuccess = false
+			default:
+				hasActive = true
+				allSuccess = false
+			}
+		}
+
+		switch {
+		case allSuccess:
+			parent.State = models.TaskStateCompleted
+		case hasFailed && !hasActive:
+			parent.State = models.TaskStateFailed
+		default:
+			parent.State = models.TaskStateRunning
+		}
+		parent.UpdatedAt = time.Now()
+		next := parent.ParentID
+		s.tree.mu.Unlock()
+		parentID = next
 	}
 }
 
@@ -193,7 +230,7 @@ func (s *Scheduler) IsComplete() bool {
 	return root.State == models.TaskStateCompleted
 }
 
-// HasFailed returns true if root or any terminal failure prevents progress.
+// HasFailed returns true if the root is in a terminal FAILED state.
 func (s *Scheduler) HasFailed() bool {
 	s.tree.mu.RLock()
 	defer s.tree.mu.RUnlock()
@@ -203,4 +240,24 @@ func (s *Scheduler) HasFailed() bool {
 		return true
 	}
 	return root.State == models.TaskStateFailed
+}
+
+// DescribeStuck explains why no node is currently runnable.
+func (s *Scheduler) DescribeStuck() string {
+	s.tree.mu.RLock()
+	defer s.tree.mu.RUnlock()
+
+	var pendingLeaves, blockedLeaves, pendingCompounds int
+	for _, node := range s.tree.Nodes {
+		switch {
+		case node.Type == models.NodeTypeLeaf && node.State == models.TaskStatePending:
+			pendingLeaves++
+			if !s.areDependenciesSatisfiedLocked(node) {
+				blockedLeaves++
+			}
+		case node.Type == models.NodeTypeCompound && node.State == models.TaskStatePending && len(node.ChildrenIDs) == 0:
+			pendingCompounds++
+		}
+	}
+	return fmt.Sprintf("pending leaves=%d blocked leaves=%d undecomposed compounds=%d", pendingLeaves, blockedLeaves, pendingCompounds)
 }

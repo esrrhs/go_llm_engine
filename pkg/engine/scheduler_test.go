@@ -79,3 +79,24 @@ func TestScheduler_CircularDependencyDetection(t *testing.T) {
 		t.Fatalf("expected circular dependency error, got nil")
 	}
 }
+
+func TestScheduler_ThreeLevelCompletion(t *testing.T) {
+	tree := NewTaskTree("sess_3", "Root", "Root")
+	if _, err := tree.AddChild("root", "mid", "Mid", "Mid", models.NodeTypeCompound); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tree.AddChild("mid", "leaf", "Leaf", "Leaf", models.NodeTypeLeaf); err != nil {
+		t.Fatal(err)
+	}
+	s := NewScheduler(tree)
+	if err := s.UpdateNodeState("leaf", models.TaskStateCompleted, ""); err != nil {
+		t.Fatal(err)
+	}
+	mid, _ := tree.GetNode("mid")
+	if mid.State != models.TaskStateCompleted {
+		t.Fatalf("mid=%s", mid.State)
+	}
+	if !s.IsComplete() {
+		t.Fatalf("root=%s", tree.GetRoot().State)
+	}
+}

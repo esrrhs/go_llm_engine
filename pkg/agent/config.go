@@ -1,0 +1,85 @@
+package agent
+
+import (
+	"os"
+	"strings"
+	"time"
+)
+
+// Config controls the engine run.
+type Config struct {
+	WorkDir   string
+	DataDir   string
+	SessionID string
+	Goal      string
+
+	APIKey    string
+	BaseURL   string
+	Model     string
+	ExtraJSON string
+
+	Temperature float64
+	MaxTokens   int
+
+	RequestTimeout     time.Duration
+	MinRequestInterval time.Duration
+
+	MaxSteps       int
+	MaxRetries     int // 0 = retry forever
+	MaxDepth       int
+	MaxSubtasks    int
+	MaxRedecompose int
+	DecomposeTries int // 0 = retry forever
+
+	RetryMinInterval time.Duration
+	RetryMaxInterval time.Duration
+
+	NativeTools bool
+	Stream      bool
+	Verbose     bool
+}
+
+// DefaultConfig fills in usable defaults.
+func DefaultConfig() Config {
+	return Config{
+		WorkDir:          ".",
+		DataDir:          ".go_llm_engine",
+		BaseURL:          firstEnv("OPENAI_BASE_URL", "LLM_BASE_URL", "https://api.openai.com/v1"),
+		APIKey:           firstEnv("OPENAI_API_KEY", "LLM_API_KEY", ""),
+		Model:            firstEnv("OPENAI_MODEL", "LLM_MODEL", "gpt-4o-mini"),
+		Temperature:      0.2,
+		MaxTokens:        4096,
+		RequestTimeout:   120 * time.Second,
+		MaxSteps:         20,
+		MaxRetries:       0,
+		MaxDepth:         4,
+		MaxSubtasks:      6,
+		MaxRedecompose:   2,
+		DecomposeTries:   0,
+		RetryMinInterval: time.Second,
+		RetryMaxInterval: 30 * time.Second,
+		Stream:           true,
+	}
+}
+
+// RequiresAPIKey is false for typical local OpenAI-compatible servers.
+func (c Config) RequiresAPIKey() bool {
+	u := strings.ToLower(c.BaseURL)
+	return !strings.Contains(u, "localhost") && !strings.Contains(u, "127.0.0.1") && !strings.Contains(u, "0.0.0.0")
+}
+
+func firstEnv(keys ...string) string {
+	for i, k := range keys {
+		if i == len(keys)-1 && !isEnvKey(k) {
+			return k
+		}
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func isEnvKey(s string) bool {
+	return strings.Contains(s, "_") && strings.ToUpper(s) == s
+}

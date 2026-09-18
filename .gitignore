@@ -6,3 +6,7 @@ bin/
 
 # Local session storage
 .go_llm_engine/
+
+# Local workspaces
+ws/
+workspace/
